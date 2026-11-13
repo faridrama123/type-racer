@@ -30,7 +30,7 @@ interface WifiLobbyPanelProps {
   onUpdateProfile: (name: string, carModel: CarModelId, carColor: string) => void;
   room: RoomState | null;
   currentPlayerId: string | null;
-  wsConnected: boolean;
+  serverReady: boolean;
   onCreateRoom: (opts: {
     roomName: string;
     isPublic: boolean;
@@ -52,7 +52,7 @@ export const WifiLobbyPanel: React.FC<WifiLobbyPanelProps> = ({
   onUpdateProfile,
   room,
   currentPlayerId,
-  wsConnected,
+  serverReady,
   onCreateRoom,
   onJoinRoom,
   onLeaveRoom,
@@ -62,7 +62,7 @@ export const WifiLobbyPanel: React.FC<WifiLobbyPanelProps> = ({
   onNotify,
   initialJoinCode = '',
 }) => {
-  const [roomName, setRoomName] = useState(`Arena ${playerName || 'Wi-Fi'}`);
+  const [roomName, setRoomName] = useState(`Arena ${playerName || 'Online'}`);
   const [language, setLanguage] = useState<Language>('id');
   const [isPublic, setIsPublic] = useState(true);
   const [joinCode, setJoinCode] = useState(initialJoinCode);
@@ -139,7 +139,7 @@ export const WifiLobbyPanel: React.FC<WifiLobbyPanelProps> = ({
     try {
       await navigator.clipboard.writeText(inviteUrl);
       setCopiedInvite(true);
-      onNotify('Link undangan ruang Wi-Fi berhasil disalin.');
+      onNotify('Link undangan ruang berhasil disalin.');
       setTimeout(() => setCopiedInvite(false), 2000);
     } catch {
       onNotify(`Bagikan kode ruang: ${code}`);
@@ -207,13 +207,13 @@ export const WifiLobbyPanel: React.FC<WifiLobbyPanelProps> = ({
             <div>
               <div className="flex items-center gap-2 text-xs font-medium text-slate-500">
                 <Wifi className="w-4 h-4 text-emerald-600" />
-                <span>Ruang Balap Wi-Fi</span>
+                <span>Ruang Balap Online &amp; Wi-Fi</span>
                 <span aria-hidden="true">·</span>
-                <span>{room.isPublic ? 'Terbuka di Jaringan' : 'Ruang Privat'}</span>
+                <span>{room.isPublic ? 'Terbuka di Daftar Ruang' : 'Ruang Privat'}</span>
               </div>
               <h2 className="text-2xl font-bold text-slate-900 mt-1">{room.name}</h2>
               <p className="text-sm text-slate-600 mt-1">
-                Bagikan kode ruang atau pindai QR dari perangkat lain di Wi-Fi yang sama.
+                Bagikan link undangan atau kode ruang ke teman dari jaringan mana saja (beda Wi-Fi, kuota seluler, atau 1 Wi-Fi yang sama).
               </p>
             </div>
 
@@ -246,7 +246,7 @@ export const WifiLobbyPanel: React.FC<WifiLobbyPanelProps> = ({
                 className="inline-flex items-center gap-2 px-4 py-3 rounded-xl border border-slate-300 bg-white text-slate-800 text-sm font-semibold hover:bg-slate-50 transition-colors whitespace-nowrap"
               >
                 <QrCode className="w-4 h-4 text-slate-600" />
-                <span>{showQrModal ? 'Tutup QR' : 'QR Wi-Fi'}</span>
+                <span>{showQrModal ? 'Tutup QR' : 'QR Undangan'}</span>
               </button>
 
               <button
@@ -575,9 +575,9 @@ export const WifiLobbyPanel: React.FC<WifiLobbyPanelProps> = ({
         {/* Create Room */}
         <section className="lg:col-span-6 bg-white rounded-2xl border border-slate-200 shadow-sm p-6 flex flex-col justify-between">
           <div>
-            <h2 className="text-lg font-bold text-slate-900">Buat Ruang Balap Wi-Fi</h2>
+            <h2 className="text-lg font-bold text-slate-900">Buat Ruang Balap Online / Wi-Fi</h2>
             <p className="text-sm text-slate-600 mt-1">
-              Jadilah Host, pilih teks Indonesia atau Inggris, lalu undang teman di jaringan Wi-Fi yang sama.
+              Buat ruang untuk balapan bersama teman secara online (beda jaringan/kuota HP) maupun dalam 1 Wi-Fi yang sama.
             </p>
 
             <form onSubmit={handleCreateSubmit} className="mt-5 space-y-4">
@@ -636,26 +636,26 @@ export const WifiLobbyPanel: React.FC<WifiLobbyPanelProps> = ({
                   onChange={(e) => setIsPublic(e.target.checked)}
                   className="w-4 h-4 rounded accent-orange-600"
                 />
-                <span>Tampilkan ruang di daftar penemuan jaringan Wi-Fi</span>
+                <span>Tampilkan di daftar Ruang Aktif agar teman mudah bergabung</span>
               </label>
 
               <button
                 type="submit"
-                disabled={!wsConnected}
+                disabled={!serverReady}
                 className="w-full py-3 rounded-xl bg-orange-600 text-white text-sm font-bold hover:bg-orange-700 transition-colors disabled:opacity-50"
               >
-                {wsConnected ? 'Buat Ruang Balap' : 'Menghubungkan ke server...'}
+                {serverReady ? 'Buat Ruang Balap' : 'Menghubungkan ke server...'}
               </button>
             </form>
           </div>
         </section>
 
-        {/* Join via Code + Active LAN Rooms */}
+        {/* Join via Code + Active Rooms */}
         <section className="lg:col-span-6 bg-white rounded-2xl border border-slate-200 shadow-sm p-6 flex flex-col justify-between space-y-5">
           <div>
             <h2 className="text-lg font-bold text-slate-900">Gabung ke Ruang Teman</h2>
             <p className="text-sm text-slate-600 mt-1">
-              Masukkan 5 huruf kode ruang atau pilih ruang aktif yang terdeteksi di jaringan.
+              Masukkan 5 huruf kode ruang dari teman atau pilih ruang aktif di bawah ini.
             </p>
 
             <form onSubmit={handleJoinSubmit} className="mt-4 flex gap-2.5">
@@ -670,7 +670,7 @@ export const WifiLobbyPanel: React.FC<WifiLobbyPanelProps> = ({
               />
               <button
                 type="submit"
-                disabled={!wsConnected}
+                disabled={!serverReady}
                 className="px-5 py-2.5 rounded-xl bg-slate-900 text-white text-sm font-bold hover:bg-slate-800 transition-colors whitespace-nowrap disabled:opacity-50"
               >
                 Gabung
@@ -681,7 +681,7 @@ export const WifiLobbyPanel: React.FC<WifiLobbyPanelProps> = ({
           <div className="pt-4 border-t border-slate-200 flex-1 flex flex-col">
             <div className="flex items-center justify-between mb-3">
               <h3 className="text-sm font-bold text-slate-900">
-                Ruang Aktif di Jaringan Wi-Fi Ini
+                Ruang Aktif Saat Ini
               </h3>
               <button
                 type="button"
@@ -698,7 +698,7 @@ export const WifiLobbyPanel: React.FC<WifiLobbyPanelProps> = ({
 
             {publicRooms.length === 0 ? (
               <div className="rounded-xl bg-slate-50 border border-slate-200 p-4 text-center text-xs text-slate-500 my-auto">
-                Belum ada ruang terbuka di jaringan saat ini. Buat ruang baru agar teman di Wi-Fi yang sama dapat langsung bergabung.
+                Belum ada ruang terbuka saat ini. Buat ruang baru lalu bagikan link atau kodenya ke teman dari jaringan mana saja.
               </div>
             ) : (
               <div className="divide-y divide-slate-100">

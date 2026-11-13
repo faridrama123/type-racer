@@ -5,6 +5,7 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import { WebSocketServer, WebSocket } from 'ws';
 import type {
+  CarModelId,
   ClientWsMessage,
   Passage,
   PublicRoomSummary,
@@ -100,18 +101,21 @@ function sanitizeText(input: string, maxLen: number): string {
 }
 
 function sanitizePassage(passage: Passage): Passage {
-  const cleanText = passage.text.trim().replace(/\s+/g, ' ').slice(0, 1200);
+  const cleanText = (passage?.text || '').trim().replace(/\s+/g, ' ').slice(0, 1200);
   return {
-    id: passage.id || `custom-${Date.now()}`,
-    title: sanitizeText(passage.title || 'Teks Balapan', 80),
-    author: sanitizeText(passage.author || 'Pemain', 60),
-    category: sanitizeText(passage.category || 'Kustom', 40),
-    language: passage.language === 'en' ? 'en' : 'id',
+    id: passage?.id || `custom-${Date.now()}`,
+    title: sanitizeText(passage?.title || 'Teks Balapan', 80),
+    author: sanitizeText(passage?.author || 'Pemain', 60),
+    category: sanitizeText(passage?.category || 'Kustom', 40),
+    language: passage?.language === 'en' ? 'en' : 'id',
     difficulty:
-      passage.difficulty === 'Menengah' || passage.difficulty === 'Tantangan'
+      passage?.difficulty === 'Menengah' || passage?.difficulty === 'Tantangan'
         ? passage.difficulty
         : 'Normal',
-    text: cleanText.length >= 15 ? cleanText : 'Kecepatan mengetik lahir dari ketelitian dan irama yang stabil.',
+    text:
+      cleanText.length >= 15
+        ? cleanText
+        : 'Kecepatan mengetik lahir dari ketelitian dan irama yang stabil.',
   };
 }
 
@@ -155,6 +159,211 @@ function removePlayerFromRoom(playerId: string, roomCode: string): void {
   }
 }
 
+function createRoomForPlayer(params: {
+  playerId: string;
+  playerName: string;
+  carModel: CarModelId;
+  carColor: string;
+  roomName: string;
+  isPublic: boolean;
+  passage: Passage;
+  ws?: WebSocket;
+}): ServerRoom {
+  const code = generateRoomCode();
+  const cleanPlayerName = sanitizeText(params.playerName || 'Host', 20) || 'Host';
+  const cleanRoomName = sanitizeText(params.roomName || `Ruang ${cleanPlayerName}`, 32);
+  const passage = sanitizePassage(params.passage);
+
+  const hostPlayer: RacerState = {
+    id: params.playerId,
+    name: cleanPlayerName,
+    carModel: params.carModel || 'formula',
+    carColor: params.carColor || '#EA580C',
+    isHost: true,
+    isReady: true,
+    isConnected: true,
+    progress: 0,
+    typedChars: 0,
+    wpm: 0,
+    accuracy: 100,
+    mistakes: 0,
+    finished: false,
+    finishRank: null,
+    finishTimeMs: null,
+  };
+
+  const clients = new Map<string, WebSocket>();
+  if (params.ws) {
+    clients.set(params.playerId, params.ws);
+  }
+
+  const room: ServerRoom = {
+    state: {
+      code,
+      name: cleanRoomName,
+      status: 'LOBBY',
+      isPublic: Boolean(params.isPublic),
+      passage,
+      countdownSeconds: 3,
+      startTime: null,
+      players: [hostPlayer],
+    },
+    clients,
+    countdownInterval: null,
+    cleanupTimeout: null,
+  };
+
+  rooms.set(code, room);
+  broadcastRoomState(room);
+  return room;
+}
+
+function joinRoomForPlayer(params: {
+  code: string;
+  playerId: string;
+  playerName: string;
+  carModel: CarModelId;
+  carColor: string;
+  ws?: WebSocket;
+}): { room?: ServerRoom; error?: string } {
+  const targetCode = params.code.trim().toUpperCase();
+  const room = rooms.get(targetCode);
+  if (!room) {
+    return { error: `Ruang dengan kode "${targetCode}" tidak ditemukan.` };
+  }
+  if (room.state.players.length >= 8 && !room.state.players.some((p) => p.id === params.playerId)) {
+    return { error: 'Ruang balap sudah penuh (maksimal 8 pembalap).' };
+  }
+
+  if (room.cleanupTimeout) {
+    clearTimeout(room.cleanupTimeout);
+    room.cleanupTimeout = null;
+  }
+
+  const existing = room.state.players.find((p) => p.id === params.playerId);
+  if (!existing) {
+    const cleanName = sanitizeText(params.playerName || 'Pembalap', 20) || 'Pembalap';
+    const newPlayer: RacerState = {
+      id: params.playerId,
+      name: cleanName,
+      carModel: params.carModel || 'gt',
+      carColor: params.carColor || '#2563EB',
+      isHost: room.state.players.length === 0,
+      isReady: false,
+      isConnected: true,
+      progress: 0,
+      typedChars: 0,
+      wpm: 0,
+      accuracy: 100,
+      mistakes: 0,
+      finished: false,
+      finishRank: null,
+      finishTimeMs: null,
+    };
+    room.state.players.push(newPlayer);
+  }
+
+  if (params.ws) {
+    room.clients.set(params.playerId, params.ws);
+  }
+  broadcastRoomState(room);
+  return { room };
+}
+
+function startCountdownInRoom(room: ServerRoom): void {
+  if (room.countdownInterval) {
+    clearInterval(room.countdownInterval);
+  }
+
+  room.state.status = 'COUNTDOWN';
+  room.state.countdownSeconds = 3;
+  room.state.startTime = null;
+  for (const p of room.state.players) {
+    p.progress = 0;
+    p.typedChars = 0;
+    p.wpm = 0;
+    p.accuracy = 100;
+    p.mistakes = 0;
+    p.finished = false;
+    p.finishRank = null;
+    p.finishTimeMs = null;
+  }
+
+  broadcastRoomState(room);
+  broadcastRoomEvent(room, { type: 'race:countdown', payload: { seconds: 3 } });
+
+  room.countdownInterval = setInterval(() => {
+    const currentRoom = rooms.get(room.state.code);
+    if (!currentRoom || currentRoom.state.status !== 'COUNTDOWN') {
+      if (room.countdownInterval) clearInterval(room.countdownInterval);
+      return;
+    }
+
+    currentRoom.state.countdownSeconds -= 1;
+    if (currentRoom.state.countdownSeconds > 0) {
+      broadcastRoomState(currentRoom);
+      broadcastRoomEvent(currentRoom, {
+        type: 'race:countdown',
+        payload: { seconds: currentRoom.state.countdownSeconds },
+      });
+    } else {
+      if (currentRoom.countdownInterval) {
+        clearInterval(currentRoom.countdownInterval);
+        currentRoom.countdownInterval = null;
+      }
+      const now = Date.now();
+      currentRoom.state.status = 'RACING';
+      currentRoom.state.startTime = now;
+      currentRoom.state.countdownSeconds = 0;
+      broadcastRoomEvent(currentRoom, {
+        type: 'race:started',
+        payload: { startTime: now },
+      });
+      broadcastRoomState(currentRoom);
+    }
+  }, 1000);
+}
+
+function applyProgressInRoom(
+  room: ServerRoom,
+  player: RacerState,
+  payload: {
+    typedChars: number;
+    mistakes: number;
+    accuracy: number;
+    finished: boolean;
+  }
+): void {
+  if (room.state.status !== 'RACING' || !room.state.startTime) return;
+  if (player.finished) return;
+
+  const passageLen = room.state.passage.text.length;
+  const typedChars = Math.max(0, Math.min(passageLen, Math.round(payload.typedChars)));
+  const elapsedMs = Math.max(300, Date.now() - room.state.startTime);
+  const wpm = Math.min(320, Math.round((typedChars / 5) / (elapsedMs / 60000)));
+  const progress = Math.min(100, Math.round((typedChars / passageLen) * 1000) / 10);
+
+  player.typedChars = typedChars;
+  player.wpm = wpm;
+  player.mistakes = Math.max(0, Math.round(payload.mistakes));
+  player.accuracy = Math.max(0, Math.min(100, Math.round(payload.accuracy * 10) / 10));
+  player.progress = progress;
+
+  if (payload.finished && typedChars >= passageLen) {
+    player.finished = true;
+    player.progress = 100;
+    player.finishTimeMs = elapsedMs;
+    const finishedCount = room.state.players.filter((p) => p.finished).length;
+    player.finishRank = finishedCount;
+
+    if (room.state.players.every((p) => p.finished)) {
+      room.state.status = 'FINISHED';
+    }
+  }
+
+  broadcastRoomState(room);
+}
+
 async function startServer() {
   const app = express();
   app.use(express.json({ limit: '64kb' }));
@@ -187,6 +396,152 @@ async function startServer() {
       }
     }
     res.json({ rooms: publicRooms });
+  });
+
+  // HTTP fallback & hybrid multiplayer endpoints
+  app.post('/api/rooms/create', (req, res) => {
+    const body = req.body as {
+      playerId?: string;
+      playerName?: string;
+      carModel?: CarModelId;
+      carColor?: string;
+      roomName?: string;
+      isPublic?: boolean;
+      passage?: Passage;
+    };
+    const playerId = sanitizeText(body.playerId || generateId(10), 24) || generateId(10);
+    const room = createRoomForPlayer({
+      playerId,
+      playerName: body.playerName || 'Host',
+      carModel: body.carModel || 'formula',
+      carColor: body.carColor || '#EA580C',
+      roomName: body.roomName || 'Ruang Balap',
+      isPublic: body.isPublic !== false,
+      passage: body.passage as Passage,
+    });
+    res.json({ room: room.state, playerId });
+  });
+
+  app.post('/api/rooms/:code/join', (req, res) => {
+    const body = req.body as {
+      playerId?: string;
+      playerName?: string;
+      carModel?: CarModelId;
+      carColor?: string;
+    };
+    const playerId = sanitizeText(body.playerId || generateId(10), 24) || generateId(10);
+    const result = joinRoomForPlayer({
+      code: req.params.code,
+      playerId,
+      playerName: body.playerName || 'Pembalap',
+      carModel: body.carModel || 'gt',
+      carColor: body.carColor || '#2563EB',
+    });
+    if (result.error || !result.room) {
+      res.status(404).json({ error: result.error || 'Ruang tidak ditemukan.' });
+      return;
+    }
+    res.json({ room: result.room.state, playerId });
+  });
+
+  app.get('/api/rooms/:code/state', (req, res) => {
+    const room = rooms.get(req.params.code.trim().toUpperCase());
+    if (!room) {
+      res.status(404).json({ error: 'Ruang tidak ditemukan atau telah ditutup.' });
+      return;
+    }
+    res.json({ room: room.state });
+  });
+
+  app.post('/api/rooms/:code/action', (req, res) => {
+    const code = req.params.code.trim().toUpperCase();
+    const room = rooms.get(code);
+    if (!room) {
+      res.status(404).json({ error: 'Ruang tidak ditemukan.' });
+      return;
+    }
+    const body = req.body as {
+      playerId?: string;
+      action?: string;
+      payload?: Record<string, unknown>;
+    };
+    const playerId = body.playerId || '';
+    if (body.action === 'leave') {
+      removePlayerFromRoom(playerId, code);
+      res.json({ left: true });
+      return;
+    }
+
+    const player = room.state.players.find((p) => p.id === playerId);
+    if (!player) {
+      res.status(403).json({ error: 'Pembalap tidak terdaftar di ruang ini.' });
+      return;
+    }
+
+    if (body.action === 'ready' && room.state.status === 'LOBBY') {
+      player.isReady = Boolean(body.payload?.isReady);
+      broadcastRoomState(room);
+    } else if (body.action === 'update_car' && room.state.status === 'LOBBY') {
+      player.carModel = (body.payload?.carModel as CarModelId) || player.carModel;
+      player.carColor = (body.payload?.carColor as string) || player.carColor;
+      broadcastRoomState(room);
+    } else if (body.action === 'update_passage' && player.isHost && room.state.status === 'LOBBY') {
+      room.state.passage = sanitizePassage(body.payload?.passage as Passage);
+      broadcastRoomState(room);
+    } else if (body.action === 'start' && player.isHost && room.state.status === 'LOBBY') {
+      startCountdownInRoom(room);
+    } else if (body.action === 'rematch' && player.isHost) {
+      if (room.countdownInterval) {
+        clearInterval(room.countdownInterval);
+        room.countdownInterval = null;
+      }
+      room.state.status = 'LOBBY';
+      room.state.countdownSeconds = 3;
+      room.state.startTime = null;
+      room.state.passage = sanitizePassage(body.payload?.passage as Passage);
+      for (const p of room.state.players) {
+        p.progress = 0;
+        p.typedChars = 0;
+        p.wpm = 0;
+        p.accuracy = 100;
+        p.mistakes = 0;
+        p.finished = false;
+        p.finishRank = null;
+        p.finishTimeMs = null;
+        p.isReady = p.isHost;
+      }
+      broadcastRoomState(room);
+    }
+
+    res.json({ room: room.state });
+  });
+
+  app.post('/api/rooms/:code/progress', (req, res) => {
+    const code = req.params.code.trim().toUpperCase();
+    const room = rooms.get(code);
+    if (!room) {
+      res.status(404).json({ error: 'Ruang tidak ditemukan.' });
+      return;
+    }
+    const body = req.body as {
+      playerId?: string;
+      typedChars?: number;
+      mistakes?: number;
+      accuracy?: number;
+      finished?: boolean;
+    };
+    const player = room.state.players.find((p) => p.id === body.playerId);
+    if (!player) {
+      res.status(403).json({ error: 'Pembalap tidak ditemukan.' });
+      return;
+    }
+    applyProgressInRoom(room, player, {
+      typedChars: Number(body.typedChars || 0),
+      mistakes: Number(body.mistakes || 0),
+      accuracy: Number(body.accuracy ?? 100),
+      finished: Boolean(body.finished),
+    });
+    res.json({ room: room.state });
   });
 
   app.post('/api/results', (req, res) => {
@@ -272,10 +627,19 @@ async function startServer() {
     roomCode: string | null;
   }
 
-  wss.on('connection', (rawWs: WebSocket) => {
+  wss.on('connection', (rawWs: WebSocket, req) => {
     const ws = rawWs as ExtWebSocket;
     ws.isAlive = true;
-    ws.playerId = generateId(10);
+
+    let requestedId = '';
+    try {
+      const url = new URL(req.url || '/ws', 'http://localhost');
+      requestedId = sanitizeText(url.searchParams.get('playerId') || '', 24);
+    } catch {
+      requestedId = '';
+    }
+
+    ws.playerId = requestedId || generateId(10);
     ws.roomCode = null;
 
     sendToSocket(ws, {
@@ -300,107 +664,41 @@ async function startServer() {
           removePlayerFromRoom(ws.playerId, ws.roomCode);
           ws.roomCode = null;
         }
-
-        const code = generateRoomCode();
-        const playerName = sanitizeText(msg.payload.playerName || 'Host', 20) || 'Host';
-        const roomName = sanitizeText(msg.payload.roomName || `Ruang ${playerName}`, 32);
-        const passage = sanitizePassage(msg.payload.passage);
-
-        const hostPlayer: RacerState = {
-          id: ws.playerId,
-          name: playerName,
-          carModel: msg.payload.carModel || 'formula',
-          carColor: msg.payload.carColor || '#EA580C',
-          isHost: true,
-          isReady: true,
-          isConnected: true,
-          progress: 0,
-          typedChars: 0,
-          wpm: 0,
-          accuracy: 100,
-          mistakes: 0,
-          finished: false,
-          finishRank: null,
-          finishTimeMs: null,
-        };
-
-        const room: ServerRoom = {
-          state: {
-            code,
-            name: roomName,
-            status: 'LOBBY',
-            isPublic: Boolean(msg.payload.isPublic),
-            passage,
-            countdownSeconds: 3,
-            startTime: null,
-            players: [hostPlayer],
-          },
-          clients: new Map([[ws.playerId, ws]]),
-          countdownInterval: null,
-          cleanupTimeout: null,
-        };
-
-        rooms.set(code, room);
-        ws.roomCode = code;
-        broadcastRoomState(room);
+        const room = createRoomForPlayer({
+          playerId: ws.playerId,
+          playerName: msg.payload.playerName,
+          carModel: msg.payload.carModel,
+          carColor: msg.payload.carColor,
+          roomName: msg.payload.roomName,
+          isPublic: msg.payload.isPublic,
+          passage: msg.payload.passage,
+          ws,
+        });
+        ws.roomCode = room.state.code;
         return;
       }
 
       if (msg.type === 'room:join') {
         const targetCode = msg.payload.code.trim().toUpperCase();
-        const room = rooms.get(targetCode);
-        if (!room) {
-          sendToSocket(ws, {
-            type: 'error',
-            payload: { message: `Ruang dengan kode "${targetCode}" tidak ditemukan.` },
-          });
-          return;
-        }
-
-        if (room.state.players.length >= 8) {
-          sendToSocket(ws, {
-            type: 'error',
-            payload: { message: 'Ruang balap sudah penuh (maksimal 8 pembalap).' },
-          });
-          return;
-        }
-
         if (ws.roomCode && ws.roomCode !== targetCode) {
           removePlayerFromRoom(ws.playerId, ws.roomCode);
         }
-
-        if (room.cleanupTimeout) {
-          clearTimeout(room.cleanupTimeout);
-          room.cleanupTimeout = null;
+        const result = joinRoomForPlayer({
+          code: targetCode,
+          playerId: ws.playerId,
+          playerName: msg.payload.playerName,
+          carModel: msg.payload.carModel,
+          carColor: msg.payload.carColor,
+          ws,
+        });
+        if (result.error || !result.room) {
+          sendToSocket(ws, {
+            type: 'error',
+            payload: { message: result.error || 'Gagal bergabung ke ruang.' },
+          });
+          return;
         }
-
-        const existing = room.state.players.find((p) => p.id === ws.playerId);
-        if (!existing) {
-          const playerName =
-            sanitizeText(msg.payload.playerName || 'Pembalap', 20) || 'Pembalap';
-          const newPlayer: RacerState = {
-            id: ws.playerId,
-            name: playerName,
-            carModel: msg.payload.carModel || 'gt',
-            carColor: msg.payload.carColor || '#2563EB',
-            isHost: room.state.players.length === 0,
-            isReady: false,
-            isConnected: true,
-            progress: 0,
-            typedChars: 0,
-            wpm: 0,
-            accuracy: 100,
-            mistakes: 0,
-            finished: false,
-            finishRank: null,
-            finishTimeMs: null,
-          };
-          room.state.players.push(newPlayer);
-        }
-
-        room.clients.set(ws.playerId, ws);
-        ws.roomCode = targetCode;
-        broadcastRoomState(room);
+        ws.roomCode = result.room.state.code;
         return;
       }
 
@@ -443,89 +741,12 @@ async function startServer() {
 
       if (msg.type === 'race:start') {
         if (!player.isHost || room.state.status !== 'LOBBY') return;
-        if (room.countdownInterval) {
-          clearInterval(room.countdownInterval);
-        }
-
-        room.state.status = 'COUNTDOWN';
-        room.state.countdownSeconds = 3;
-        room.state.startTime = null;
-        for (const p of room.state.players) {
-          p.progress = 0;
-          p.typedChars = 0;
-          p.wpm = 0;
-          p.accuracy = 100;
-          p.mistakes = 0;
-          p.finished = false;
-          p.finishRank = null;
-          p.finishTimeMs = null;
-        }
-
-        broadcastRoomState(room);
-        broadcastRoomEvent(room, { type: 'race:countdown', payload: { seconds: 3 } });
-
-        room.countdownInterval = setInterval(() => {
-          const currentRoom = rooms.get(room.state.code);
-          if (!currentRoom || currentRoom.state.status !== 'COUNTDOWN') {
-            if (room.countdownInterval) clearInterval(room.countdownInterval);
-            return;
-          }
-
-          currentRoom.state.countdownSeconds -= 1;
-          if (currentRoom.state.countdownSeconds > 0) {
-            broadcastRoomState(currentRoom);
-            broadcastRoomEvent(currentRoom, {
-              type: 'race:countdown',
-              payload: { seconds: currentRoom.state.countdownSeconds },
-            });
-          } else {
-            if (currentRoom.countdownInterval) {
-              clearInterval(currentRoom.countdownInterval);
-              currentRoom.countdownInterval = null;
-            }
-            const now = Date.now();
-            currentRoom.state.status = 'RACING';
-            currentRoom.state.startTime = now;
-            currentRoom.state.countdownSeconds = 0;
-            broadcastRoomEvent(currentRoom, {
-              type: 'race:started',
-              payload: { startTime: now },
-            });
-            broadcastRoomState(currentRoom);
-          }
-        }, 1000);
+        startCountdownInRoom(room);
         return;
       }
 
       if (msg.type === 'race:progress') {
-        if (room.state.status !== 'RACING' || !room.state.startTime) return;
-        if (player.finished) return;
-
-        const passageLen = room.state.passage.text.length;
-        const typedChars = Math.max(0, Math.min(passageLen, Math.round(msg.payload.typedChars)));
-        const elapsedMs = Math.max(300, Date.now() - room.state.startTime);
-        const wpm = Math.min(320, Math.round((typedChars / 5) / (elapsedMs / 60000)));
-        const progress = Math.min(100, Math.round((typedChars / passageLen) * 1000) / 10);
-
-        player.typedChars = typedChars;
-        player.wpm = wpm;
-        player.mistakes = Math.max(0, Math.round(msg.payload.mistakes));
-        player.accuracy = Math.max(0, Math.min(100, Math.round(msg.payload.accuracy * 10) / 10));
-        player.progress = progress;
-
-        if (msg.payload.finished && typedChars >= passageLen) {
-          player.finished = true;
-          player.progress = 100;
-          player.finishTimeMs = elapsedMs;
-          const finishedCount = room.state.players.filter((p) => p.finished).length;
-          player.finishRank = finishedCount;
-
-          if (room.state.players.every((p) => p.finished)) {
-            room.state.status = 'FINISHED';
-          }
-        }
-
-        broadcastRoomState(room);
+        applyProgressInRoom(room, player, msg.payload);
         return;
       }
 
@@ -556,6 +777,7 @@ async function startServer() {
 
     ws.on('close', () => {
       if (ws.roomCode) {
+        // Only remove on WS close if they are actively using WS-only; if they leave explicitly they use room:leave
         removePlayerFromRoom(ws.playerId, ws.roomCode);
       }
     });

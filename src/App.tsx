@@ -125,10 +125,21 @@ export default function App() {
     finishTimeMs: null,
   });
 
-  // WebSocket Multiplayer State
+  // Hybrid WebSocket + HTTP Fallback Multiplayer State
   const wsRef = useRef<WebSocket | null>(null);
   const [wsConnected, setWsConnected] = useState(false);
-  const [wsPlayerId, setWsPlayerId] = useState<string | null>(null);
+  const [serverReady, setServerReady] = useState(false);
+  const [playerId, setPlayerId] = useState<string>(() => {
+    try {
+      const existing = sessionStorage.getItem('typerally_player_id');
+      if (existing) return existing;
+      const generated = `P${Math.random().toString(36).slice(2, 10).toUpperCase()}`;
+      sessionStorage.setItem('typerally_player_id', generated);
+      return generated;
+    } catch {
+      return `P${Math.random().toString(36).slice(2, 10).toUpperCase()}`;
+    }
+  });
   const [room, setRoom] = useState<RoomState | null>(null);
   const [initialRoomCode, setInitialRoomCode] = useState('');
 
@@ -138,6 +149,8 @@ export default function App() {
 
   const soloCountdownTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const lastRecordedRoomRaceRef = useRef<string | null>(null);
+  const lastRoomCountdownRef = useRef<number | null>(null);
+  const lastRoomStatusRef = useRef<RoomStatus | null>(null);
 
   const notify = useCallback((text: string, kind: 'info' | 'error' = 'info') => {
     setToast({ text, kind });
@@ -168,15 +181,32 @@ export default function App() {
       } catch {
         // ignore
       }
-      if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN && room) {
-        const msg: ClientWsMessage = {
-          type: 'player:update_car',
-          payload: { carModel: model, carColor: color },
-        };
-        wsRef.current.send(JSON.stringify(msg));
+      if (room) {
+        if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+          const msg: ClientWsMessage = {
+            type: 'player:update_car',
+            payload: { carModel: model, carColor: color },
+          };
+          wsRef.current.send(JSON.stringify(msg));
+        } else {
+          fetch(`/api/rooms/${room.code}/action`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              playerId,
+              action: 'update_car',
+              payload: { carModel: model, carColor: color },
+            }),
+          })
+            .then((r) => (r.ok ? r.json() : null))
+            .then((data) => {
+              if (data?.room) setRoom(data.room as RoomState);
+            })
+            .catch(() => {});
+        }
       }
     },
-    [room]
+    [room, playerId]
   );
 
   const saveResultToHistoryAndServer = useCallback(async (score: ShareableScore) => {
@@ -224,50 +254,61 @@ export default function App() {
     }
   }, []);
 
-  // WebSocket Connection with Reconnect
+  // Check HTTP Health + WebSocket Connection with automatic HTTP fallback
   useEffect(() => {
     let closedByCleanup = false;
     let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
 
+    fetch('/api/health')
+      .then((res) => {
+        if (res.ok && !closedByCleanup) setServerReady(true);
+      })
+      .catch(() => {});
+
     const connect = () => {
-      const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-      const wsUrl = `${protocol}//${window.location.host}/ws`;
-      const ws = new WebSocket(wsUrl);
-      wsRef.current = ws;
+      try {
+        const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+        const wsUrl = `${protocol}//${window.location.host}/ws?playerId=${encodeURIComponent(playerId)}`;
+        const ws = new WebSocket(wsUrl);
+        wsRef.current = ws;
 
-      ws.onopen = () => {
-        setWsConnected(true);
-      };
+        ws.onopen = () => {
+          setWsConnected(true);
+          setServerReady(true);
+        };
 
-      ws.onmessage = (event) => {
-        let msg: ServerWsMessage;
-        try {
-          msg = JSON.parse(event.data as string) as ServerWsMessage;
-        } catch {
-          return;
-        }
+        ws.onmessage = (event) => {
+          let msg: ServerWsMessage;
+          try {
+            msg = JSON.parse(event.data as string) as ServerWsMessage;
+          } catch {
+            return;
+          }
 
-        if (msg.type === 'session:init') {
-          setWsPlayerId(msg.payload.playerId);
-        } else if (msg.type === 'room:state') {
-          setRoom(msg.payload.room);
-        } else if (msg.type === 'room:left') {
-          setRoom(null);
-        } else if (msg.type === 'race:countdown') {
-          soundEngine.playCountdownTick(false);
-        } else if (msg.type === 'race:started') {
-          soundEngine.playCountdownTick(true);
-        } else if (msg.type === 'error') {
-          notify(msg.payload.message, 'error');
-        }
-      };
+          if (msg.type === 'session:init') {
+            setPlayerId(msg.payload.playerId);
+          } else if (msg.type === 'room:state') {
+            setRoom(msg.payload.room);
+          } else if (msg.type === 'room:left') {
+            setRoom(null);
+          } else if (msg.type === 'race:countdown') {
+            soundEngine.playCountdownTick(false);
+          } else if (msg.type === 'race:started') {
+            soundEngine.playCountdownTick(true);
+          } else if (msg.type === 'error') {
+            notify(msg.payload.message, 'error');
+          }
+        };
 
-      ws.onclose = () => {
+        ws.onclose = () => {
+          setWsConnected(false);
+          if (!closedByCleanup) {
+            reconnectTimer = setTimeout(connect, 5000);
+          }
+        };
+      } catch {
         setWsConnected(false);
-        if (!closedByCleanup) {
-          reconnectTimer = setTimeout(connect, 2000);
-        }
-      };
+      }
     };
 
     connect();
@@ -277,12 +318,56 @@ export default function App() {
       if (reconnectTimer) clearTimeout(reconnectTimer);
       wsRef.current?.close();
     };
-  }, [notify]);
+  }, [notify, playerId]);
 
-  // Record finished Wi-Fi race to history/server once per race
+  // HTTP Polling fallback when WebSocket is unavailable in preview/proxy environments
   useEffect(() => {
-    if (!room || !wsPlayerId || !room.startTime) return;
-    const me = room.players.find((p) => p.id === wsPlayerId);
+    if (!room || wsConnected) return;
+
+    const intervalMs =
+      room.status === 'RACING' || room.status === 'COUNTDOWN' ? 350 : 1200;
+
+    const poll = setInterval(async () => {
+      try {
+        const res = await fetch(`/api/rooms/${room.code}/state`);
+        if (res.status === 404) {
+          setRoom(null);
+          notify('Ruang balap telah ditutup.', 'info');
+          return;
+        }
+        if (res.ok) {
+          const data = (await res.json()) as { room: RoomState };
+          const nextRoom = data.room;
+
+          if (
+            nextRoom.status === 'COUNTDOWN' &&
+            lastRoomCountdownRef.current !== nextRoom.countdownSeconds
+          ) {
+            soundEngine.playCountdownTick(false);
+          }
+          if (
+            lastRoomStatusRef.current === 'COUNTDOWN' &&
+            nextRoom.status === 'RACING'
+          ) {
+            soundEngine.playCountdownTick(true);
+          }
+          lastRoomCountdownRef.current = nextRoom.countdownSeconds;
+          lastRoomStatusRef.current = nextRoom.status;
+
+          setRoom(nextRoom);
+        }
+      } catch {
+        // ignore transient polling error
+      }
+    }, intervalMs);
+
+    return () => clearInterval(poll);
+  }, [room, wsConnected, notify]);
+
+  // Record finished online race to history/server once per race
+  useEffect(() => {
+    if (!room || !playerId || !room.startTime) return;
+    const me = room.players.find((p) => p.id === playerId);
     if (!me || !me.finished) return;
 
     const raceKey = `${room.code}-${room.startTime}`;
@@ -311,7 +396,7 @@ export default function App() {
       setModalScore(saved);
       setIsChallengeView(false);
     });
-  }, [room, wsPlayerId, saveResultToHistoryAndServer]);
+  }, [room, playerId, saveResultToHistoryAndServer]);
 
   // Solo Pace Bot simulation loop (explicitly labeled as Pace Bot)
   useEffect(() => {
@@ -488,13 +573,93 @@ export default function App() {
     ]
   );
 
-  // WebSocket Actions
-  const sendWs = (msg: ClientWsMessage) => {
-    if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) {
-      notify('Koneksi ke server sedang terputus. Mencoba menyambung ulang...', 'error');
+  // Hybrid WebSocket + HTTP Room Actions
+  const sendRoomMessage = async (msg: ClientWsMessage) => {
+    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+      wsRef.current.send(JSON.stringify(msg));
       return;
     }
-    wsRef.current.send(JSON.stringify(msg));
+
+    try {
+      if (msg.type === 'room:create') {
+        const res = await fetch('/api/rooms/create', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ playerId, ...msg.payload }),
+        });
+        const data = (await res.json()) as { room?: RoomState; playerId?: string; error?: string };
+        if (!res.ok || !data.room) {
+          notify(data.error || 'Gagal membuat ruang balap.', 'error');
+          return;
+        }
+        if (data.playerId) setPlayerId(data.playerId);
+        setRoom(data.room);
+        return;
+      }
+
+      if (msg.type === 'room:join') {
+        const code = msg.payload.code.trim().toUpperCase();
+        const res = await fetch(`/api/rooms/${encodeURIComponent(code)}/join`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ playerId, ...msg.payload }),
+        });
+        const data = (await res.json()) as { room?: RoomState; playerId?: string; error?: string };
+        if (!res.ok || !data.room) {
+          notify(data.error || 'Gagal bergabung ke ruang.', 'error');
+          return;
+        }
+        if (data.playerId) setPlayerId(data.playerId);
+        setRoom(data.room);
+        return;
+      }
+
+      if (!room) return;
+
+      if (msg.type === 'race:progress') {
+        const res = await fetch(`/api/rooms/${room.code}/progress`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ playerId, ...msg.payload }),
+        });
+        if (res.ok) {
+          const data = (await res.json()) as { room?: RoomState };
+          if (data.room) setRoom(data.room);
+        }
+        return;
+      }
+
+      const actionMap: Record<string, string> = {
+        'room:leave': 'leave',
+        'player:ready': 'ready',
+        'player:update_car': 'update_car',
+        'room:update_passage': 'update_passage',
+        'race:start': 'start',
+        'race:rematch': 'rematch',
+      };
+      const action = actionMap[msg.type];
+      if (!action) return;
+
+      const res = await fetch(`/api/rooms/${room.code}/action`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          playerId,
+          action,
+          payload: 'payload' in msg ? msg.payload : undefined,
+        }),
+      });
+      if (res.ok) {
+        const data = (await res.json()) as { room?: RoomState; left?: boolean };
+        if (data.left) {
+          setRoom(null);
+        } else if (data.room) {
+          setRoom(data.room);
+        }
+      }
+    } catch {
+      notify('Gagal menghubungi server. Periksa koneksi internet Anda.', 'error');
+    }
   };
 
   const handleCreateRoom = (opts: {
@@ -502,7 +667,7 @@ export default function App() {
     isPublic: boolean;
     passage: Passage;
   }) => {
-    sendWs({
+    void sendRoomMessage({
       type: 'room:create',
       payload: {
         playerName: playerName || 'Host',
@@ -516,7 +681,7 @@ export default function App() {
   };
 
   const handleJoinRoom = (code: string) => {
-    sendWs({
+    void sendRoomMessage({
       type: 'room:join',
       payload: {
         code,
@@ -528,7 +693,7 @@ export default function App() {
   };
 
   const handleLeaveRoom = () => {
-    sendWs({ type: 'room:leave' });
+    void sendRoomMessage({ type: 'room:leave' });
     setRoom(null);
   };
 
@@ -549,7 +714,7 @@ export default function App() {
   };
 
   const soloRacers = soloPaceBotWpm > 0 ? [soloPlayer, paceBot] : [soloPlayer];
-  const wifiMe = room?.players.find((p) => p.id === wsPlayerId) || null;
+  const wifiMe = room?.players.find((p) => p.id === playerId) || null;
   const isWifiHost = Boolean(wifiMe?.isHost);
 
   return (
@@ -594,7 +759,7 @@ export default function App() {
                   : 'border-transparent hover:text-slate-900'
               }`}
             >
-              Ruang Wi-Fi
+              Main Online
             </button>
             <button
               type="button"
@@ -627,7 +792,7 @@ export default function App() {
               onClick={() => setActiveTab('wifi')}
               className="px-4 py-2 rounded-xl bg-orange-600 text-white text-sm font-semibold hover:bg-orange-700 transition-colors whitespace-nowrap shrink-0"
             >
-              {room ? `Ruang ${room.code}` : 'Main Wi-Fi'}
+              {room ? `Ruang ${room.code}` : 'Main Online'}
             </button>
           </div>
         </div>
@@ -637,7 +802,7 @@ export default function App() {
           {(
             [
               ['solo', 'Balap Solo'],
-              ['wifi', 'Ruang Wi-Fi'],
+              ['wifi', 'Main Online'],
               ['leaderboard', 'Papan Skor'],
               ['guide', 'Cara Main'],
             ] as const
@@ -905,18 +1070,18 @@ export default function App() {
                 carColor={carColor}
                 onUpdateProfile={handleUpdateProfile}
                 room={room}
-                currentPlayerId={wsPlayerId}
-                wsConnected={wsConnected}
+                currentPlayerId={playerId}
+                serverReady={serverReady}
                 onCreateRoom={handleCreateRoom}
                 onJoinRoom={handleJoinRoom}
                 onLeaveRoom={handleLeaveRoom}
                 onToggleReady={(ready) =>
-                  sendWs({ type: 'player:ready', payload: { isReady: ready } })
+                  void sendRoomMessage({ type: 'player:ready', payload: { isReady: ready } })
                 }
                 onUpdateRoomPassage={(passage) =>
-                  sendWs({ type: 'room:update_passage', payload: { passage } })
+                  void sendRoomMessage({ type: 'room:update_passage', payload: { passage } })
                 }
-                onStartRace={() => sendWs({ type: 'race:start' })}
+                onStartRace={() => void sendRoomMessage({ type: 'race:start' })}
                 onNotify={notify}
                 initialJoinCode={initialRoomCode}
               />
@@ -949,7 +1114,7 @@ export default function App() {
                 {/* Live Multi-Lane Race Track */}
                 <RaceTrack
                   players={room.players}
-                  currentPlayerId={wsPlayerId}
+                  currentPlayerId={playerId}
                   statusLabel={
                     room.status === 'COUNTDOWN'
                       ? `Mulai dalam ${room.countdownSeconds}`
@@ -966,7 +1131,7 @@ export default function App() {
                   countdownSeconds={room.countdownSeconds}
                   startTime={room.startTime}
                   onProgress={(payload) =>
-                    sendWs({ type: 'race:progress', payload })
+                    void sendRoomMessage({ type: 'race:progress', payload })
                   }
                   isMuted={isMuted}
                   onToggleMute={handleToggleMute}
@@ -979,7 +1144,7 @@ export default function App() {
                       <div className="flex items-center gap-2.5">
                         <Trophy className="w-5 h-5 text-orange-600" />
                         <h3 className="text-lg font-bold text-slate-900">
-                          Podium Balap Wi-Fi
+                          Podium Balap Online
                         </h3>
                       </div>
 
@@ -1005,7 +1170,7 @@ export default function App() {
                           <button
                             type="button"
                             onClick={() =>
-                              sendWs({
+                              void sendRoomMessage({
                                 type: 'race:rematch',
                                 payload: {
                                   passage: getRandomPassage(
@@ -1052,7 +1217,7 @@ export default function App() {
                                 </td>
                                 <td className="py-3 px-4 font-semibold text-slate-900">
                                   {p.name}
-                                  {p.id === wsPlayerId ? ' (Anda)' : ''}
+                                  {p.id === playerId ? ' (Anda)' : ''}
                                 </td>
                                 <td className="py-3 px-4 text-right font-mono font-bold text-slate-900 tabular-nums">
                                   {p.wpm} KPM
@@ -1122,10 +1287,10 @@ export default function App() {
               <div className="rounded-xl border border-slate-200 p-5 space-y-2.5">
                 <Wifi className="w-5 h-5 text-emerald-600" />
                 <h2 className="text-base font-bold text-slate-900">
-                  02. Mabar 1 Jaringan Wi-Fi
+                  02. Mabar Online &amp; 1 Wi-Fi
                 </h2>
                 <p className="text-sm text-slate-600 leading-relaxed">
-                  Buka tab Ruang Wi-Fi dan buat ruang baru. Teman yang berada di jaringan Wi-Fi yang sama cukup membuka alamat Wi-Fi lokal atau memindai QR Code yang tampil di lobi, lalu klik Gabung.
+                  Buka tab Main Online dan buat ruang baru. Teman dari jaringan mana saja (beda Wi-Fi, kuota seluler, maupun 1 Wi-Fi lokal) cukup membuka link undangan atau memasukkan 5 huruf kode ruang.
                 </p>
               </div>
 
@@ -1146,11 +1311,13 @@ export default function App() {
       {/* Quiet Footer */}
       <footer className="border-t border-slate-200 bg-white mt-auto">
         <div className="max-w-6xl mx-auto px-4 sm:px-6 py-4 flex flex-col sm:flex-row items-center justify-between gap-2 text-xs text-slate-500">
-          <span>TypeRally · Balap Mengetik Real-Time &amp; Multiplayer Wi-Fi</span>
+          <span>TypeRally · Balap Mengetik Real-Time &amp; Multiplayer Online</span>
           <span>
             {wsConnected
-              ? 'Server sinkronisasi terhubung'
-              : 'Menghubungkan server sinkronisasi...'}
+              ? 'Server sinkronisasi real-time aktif'
+              : serverReady
+                ? 'Server sinkronisasi aktif (mode HTTP)'
+                : 'Menghubungkan ke server...'}
           </span>
         </div>
       </footer>
