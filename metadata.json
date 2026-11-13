@@ -1,0 +1,6 @@
+{
+  "name": "TypeRally",
+  "description": "Game balap mengetik real-time bergaya TypeRacer dengan mode multiplayer satu jaringan Wi-Fi dan kartu skor yang dapat dibagikan.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
